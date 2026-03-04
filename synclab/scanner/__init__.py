@@ -1,0 +1,1 @@
+# SyncLab scanner - file discovery

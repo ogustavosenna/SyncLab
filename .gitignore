@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Backups
+backup_*.zip
+
+# PyInstaller
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+NUL
+
+# Temp files
+*.tmp
+*.wav
+
+# Reports (keep in repo but ignore old ones)
+# REPORT_v*.md is tracked
+
+# Assets (reference images)
+_ref_icons/
+assets/
