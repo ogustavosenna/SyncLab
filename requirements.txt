@@ -4,3 +4,7 @@ flask>=3.0
 flask-socketio>=5.3
 pywebview>=5.0
 pyinstaller>=6.0
+
+# Testing
+pytest>=7.0
+pytest-cov>=4.0
