@@ -5,11 +5,14 @@ Cross-platform: macOS (~/Library/Application Support), Linux (~/.config).
 """
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 from synclab.config import DEFAULT_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # Keys that are persisted but NOT part of DEFAULT_CONFIG
 _UI_STATE_KEYS = ("last_export_dir", "last_video_dir", "last_audio_dir",
@@ -65,7 +68,7 @@ def load_settings():
                     config[key] = saved[key]
 
         except (json.JSONDecodeError, OSError, KeyError) as e:
-            print(f"[SyncLab] Settings load failed, using defaults: {e}")
+            logger.warning("Settings load failed, using defaults: %s", e)
 
     return config
 
@@ -93,4 +96,4 @@ def save_settings(config):
             json.dump(saveable, f, indent=2, default=str)
 
     except OSError as e:
-        print(f"[SyncLab] Settings save failed: {e}")
+        logger.error("Settings save failed: %s", e)

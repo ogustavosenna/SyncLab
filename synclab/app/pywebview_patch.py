@@ -9,9 +9,12 @@ Usage:
     apply_patch(enabled=True)
 """
 
+import logging
 import os
 import traceback
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def apply_patch(enabled=True):
@@ -25,7 +28,7 @@ def apply_patch(enabled=True):
         enabled: If False, skip patching entirely.
     """
     if not enabled:
-        print("[SyncLab:Patch] EdgeChromium patch disabled by config")
+        logger.info("EdgeChromium patch disabled by config")
         return
 
     try:
@@ -43,7 +46,7 @@ def apply_patch(enabled=True):
                 break
 
         if not original_handler:
-            print("[SyncLab:Patch] Could not find on_script_notify to patch")
+            logger.debug("Could not find on_script_notify to patch")
             return
 
         def patched_on_script_notify(self, sender, args):
@@ -54,61 +57,61 @@ def apply_patch(enabled=True):
                 return_value = None
 
             if return_value and 'FilesDropped' in str(return_value):
-                print(f"\n[SyncLab:Patch] === FilesDropped message received! ===")
+                logger.debug("=== FilesDropped message received! ===")
                 try:
                     from webview.dom import _dnd_state
-                    print(f"[SyncLab:Patch] _dnd_state before: {_dnd_state}")
+                    logger.debug("_dnd_state before: %s", _dnd_state)
                 except Exception as ex:
-                    print(f"[SyncLab:Patch] Could not read _dnd_state: {ex}")
+                    logger.debug("Could not read _dnd_state: %s", ex)
 
                 try:
                     additional = args.get_AdditionalObjects()
-                    print(f"[SyncLab:Patch] AdditionalObjects: {additional}")
-                    print(f"[SyncLab:Patch] AdditionalObjects type: {type(additional)}")
+                    logger.debug("AdditionalObjects: %s", additional)
+                    logger.debug("AdditionalObjects type: %s", type(additional))
 
                     if additional is not None:
                         for i, f in enumerate(list(additional)):
                             ftype = str(type(f))
-                            print(f"[SyncLab:Patch] File[{i}] type: {ftype}")
+                            logger.debug("File[%d] type: %s", i, ftype)
 
                             # Try to get Path regardless of type name
                             try:
                                 fpath = f.Path
                                 fname = os.path.basename(fpath) if fpath else '?'
-                                print(f"[SyncLab:Patch] File[{i}].Path: {fpath}")
+                                logger.debug("File[%d].Path: %s", i, fpath)
 
                                 # If the original type check would fail, manually add
                                 if 'CoreWebView2File' not in ftype:
-                                    print(f"[SyncLab:Patch] Type check would FAIL!")
-                                    print(f"[SyncLab:Patch] Manually adding to _dnd_state")
+                                    logger.debug("Type check would FAIL!")
+                                    logger.debug("Manually adding to _dnd_state")
                                     try:
                                         from webview.dom import _dnd_state
                                         _dnd_state['paths'].append((fname, fpath))
                                     except Exception as ex2:
-                                        print(f"[SyncLab:Patch] Manual add failed: {ex2}")
+                                        logger.debug("Manual add failed: %s", ex2)
                             except Exception as ex:
-                                print(f"[SyncLab:Patch] File[{i}].Path error: {ex}")
+                                logger.debug("File[%d].Path error: %s", i, ex)
                                 # Try other attributes
                                 try:
                                     attrs = [a for a in dir(f) if not a.startswith('_')]
-                                    print(f"[SyncLab:Patch] File[{i}] attrs: {attrs}")
+                                    logger.debug("File[%d] attrs: %s", i, attrs)
                                 except Exception:
                                     pass
                     else:
-                        print("[SyncLab:Patch] AdditionalObjects is None!")
+                        logger.debug("AdditionalObjects is None!")
                 except Exception as ex:
-                    print(f"[SyncLab:Patch] AdditionalObjects error: {ex}")
-                    traceback.print_exc()
+                    logger.debug("AdditionalObjects error: %s", ex)
+                    logger.debug(traceback.format_exc())
 
             # Call original handler
             return original_handler(self, sender, args)
 
         target_class.on_script_notify = patched_on_script_notify
-        print(f"[SyncLab:Patch] Patched {target_class.__name__}.on_script_notify")
+        logger.info("Patched %s.on_script_notify", target_class.__name__)
 
     except Exception as e:
-        print(f"[SyncLab:Patch] EdgeChromium patching failed: {e}")
-        traceback.print_exc()
+        logger.warning("EdgeChromium patching failed: %s", e)
+        logger.debug(traceback.format_exc())
 
 
 def try_winforms_drag_data():
@@ -132,9 +135,9 @@ def try_winforms_drag_data():
                 path = str(files[0])
                 if os.path.exists(path):
                     folder = path if os.path.isdir(path) else str(Path(path).parent)
-                    print(f"[SyncLab:WinForms] Found path via Clipboard: {folder}")
+                    logger.debug("Found path via Clipboard: %s", folder)
                     return folder
     except Exception as e:
-        print(f"[SyncLab:WinForms] Clipboard fallback failed: {e}")
+        logger.debug("Clipboard fallback failed: %s", e)
 
     return ''

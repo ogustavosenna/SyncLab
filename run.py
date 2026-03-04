@@ -6,6 +6,7 @@ Default: Launches native PyWebView window with drag-and-drop support.
          Use --browser flag for development in Chrome.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -13,8 +14,14 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from synclab.logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
+
 
 def main():
+    setup_logging()
+
     if "--browser" in sys.argv:
         # ---- Development mode: Flask + Chrome browser ----
         import webbrowser
@@ -26,9 +33,9 @@ def main():
         port = int(os.environ.get("PORT", 5789))
         url = f"http://127.0.0.1:{port}"
 
-        print(f"\n  SyncLab v{__version__} (browser mode)")
-        print(f"  Running at: {url}")
-        print(f"  Press Ctrl+C to stop\n")
+        logger.info("SyncLab v%s (browser mode)", __version__)
+        logger.info("Running at: %s", url)
+        logger.info("Press Ctrl+C to stop")
 
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
         socketio.run(

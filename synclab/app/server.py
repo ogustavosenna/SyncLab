@@ -10,6 +10,7 @@ v1.3.0 refactoring:
   - This module retains create_app() with route definitions
 """
 
+import logging
 import os
 import sys
 import json
@@ -18,6 +19,8 @@ import tempfile
 import threading
 import zipfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_socketio import SocketIO
@@ -310,7 +313,7 @@ def create_app():
                 with open(diag_path, "w", encoding="utf-8") as f:
                     json.dump(diagnostics_data, f, indent=2, default=str)
             except Exception as diag_err:
-                print(f"[SyncLab] Diagnostics JSON write failed: {diag_err}")
+                logger.warning("Diagnostics JSON write failed: %s", diag_err)
 
             # Remember last export dir
             state["config"]["last_export_dir"] = output_dir
@@ -358,22 +361,22 @@ def create_app():
         data = request.get_json() or {}
         path = data.get("path", "")
 
-        print(f"[SyncLab:Server] /api/resolve_path called with: {path!r}")
+        logger.debug("/api/resolve_path called with: %r", path)
 
         if not path:
             return jsonify({"folder": "", "error": "empty path"})
 
         if not os.path.exists(path):
-            print(f"[SyncLab:Server] Path does NOT exist: {path!r}")
+            logger.debug("Path does NOT exist: %r", path)
             return jsonify({"folder": "", "error": f"path not found: {path}"})
 
         if os.path.isdir(path):
-            print(f"[SyncLab:Server] Resolved to folder: {path!r}")
+            logger.debug("Resolved to folder: %r", path)
             return jsonify({"folder": path})
 
         # It's a file — return parent directory
         parent = str(Path(path).parent)
-        print(f"[SyncLab:Server] Resolved to parent: {parent!r}")
+        logger.debug("Resolved to parent: %r", parent)
         return jsonify({"folder": parent})
 
     @app.route("/api/debug_log", methods=["POST"])
@@ -383,7 +386,7 @@ def create_app():
         level = data.get("level", "info")
         message = data.get("message", "")
         source = data.get("source", "JS")
-        print(f"[SyncLab:{source}:{level}] {message}")
+        logger.debug("[%s:%s] %s", source, level, message)
         return jsonify({"status": "ok"})
 
     @app.route("/api/browse", methods=["POST"])

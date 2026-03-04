@@ -29,6 +29,7 @@ go through Flask HTTP endpoints to avoid GUI thread deadlocks.
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -41,6 +42,8 @@ import webview
 from synclab.app.server import create_app
 from synclab.app.pywebview_patch import apply_patch, try_winforms_drag_data
 from synclab.settings import load_settings
+
+logger = logging.getLogger(__name__)
 
 
 class Api:
@@ -204,14 +207,14 @@ def main():
         2. Registers Python drop handlers on #videoCard and #audioCard
            via PyWebView's DOM API (which triggers pywebviewFullPath injection)
         """
-        print("\n[SyncLab] Page loaded — setting up drag-and-drop...")
+        logger.info("Page loaded — setting up drag-and-drop...")
 
         # Step 1: Inject JS helper functions
         try:
             window.evaluate_js(INJECT_JS)
-            print("[SyncLab] JS helpers injected (handleNativeDrop, _synclab_log)")
+            logger.debug("JS helpers injected (handleNativeDrop, _synclab_log)")
         except Exception as e:
-            print(f"[SyncLab] JS injection error: {e}")
+            logger.warning("JS injection error: %s", e)
 
         # Step 2: Register Python drop handlers via pywebview DOM API
         # This is THE mechanism that triggers pywebviewFullPath injection:
@@ -224,34 +227,34 @@ def main():
 
             if video_card:
                 video_card.events.drop += _make_drop_handler(window, 'video')
-                print("[SyncLab] Python drop handler registered on #videoCard")
+                logger.info("Python drop handler registered on #videoCard")
             else:
-                print("[SyncLab] WARNING: #videoCard not found in DOM")
+                logger.warning("#videoCard not found in DOM")
 
             if audio_card:
                 audio_card.events.drop += _make_drop_handler(window, 'audio')
-                print("[SyncLab] Python drop handler registered on #audioCard")
+                logger.info("Python drop handler registered on #audioCard")
             else:
-                print("[SyncLab] WARNING: #audioCard not found in DOM")
+                logger.warning("#audioCard not found in DOM")
 
             # Check _dnd_state to verify listeners were registered
             try:
                 from webview.dom import _dnd_state
-                print(f"[SyncLab] _dnd_state after registration: {_dnd_state}")
+                logger.debug("_dnd_state after registration: %s", _dnd_state)
             except Exception:
                 pass
 
         except Exception as e:
-            print(f"[SyncLab] DOM handler registration failed: {e}")
-            traceback.print_exc()
-            print("[SyncLab] Will rely on JS-only drop handlers (app.js)")
+            logger.warning("DOM handler registration failed: %s", e)
+            logger.debug(traceback.format_exc())
+            logger.info("Will rely on JS-only drop handlers (app.js)")
 
     # Register the loaded callback
     window.events.loaded += on_loaded
 
     # Start the GUI event loop (blocks until window is closed)
     debug_mode = "--debug" in sys.argv
-    print(f"[SyncLab] Starting PyWebView (debug={debug_mode})...")
+    logger.info("Starting PyWebView (debug=%s)...", debug_mode)
     start_kwargs = dict(debug=debug_mode)
     if icon_path:
         start_kwargs["icon"] = icon_path
@@ -272,7 +275,7 @@ def _make_drop_handler(window, target_type):
         target_type: 'video' or 'audio'
     """
     def handler(e):
-        print(f"\n[SyncLab:Python] === DROP on {target_type} card ===")
+        logger.debug("=== DROP on %s card ===", target_type)
 
         folder = ''
 
@@ -280,34 +283,34 @@ def _make_drop_handler(window, target_type):
         if isinstance(e, dict):
             dt = e.get('dataTransfer', {})
             files = dt.get('files', [])
-            print(f"[SyncLab:Python] Event has {len(files)} file(s)")
+            logger.debug("Event has %d file(s)", len(files))
 
             for i, f in enumerate(files):
                 if isinstance(f, dict):
                     keys = list(f.keys())
                     name = f.get('name', '?')
                     path = f.get('pywebviewFullPath', '')
-                    print(f"[SyncLab:Python] file[{i}]: name={name!r}, "
-                          f"pywebviewFullPath={path!r}, keys={keys}")
+                    logger.debug("file[%d]: name=%r, pywebviewFullPath=%r, keys=%s",
+                                 i, name, path, keys)
 
                     if path:
                         if os.path.exists(path):
                             folder = path if os.path.isdir(path) else str(Path(path).parent)
-                            print(f"[SyncLab:Python] Resolved via pywebviewFullPath: {folder}")
+                            logger.debug("Resolved via pywebviewFullPath: %s", folder)
                             break
                         else:
-                            print(f"[SyncLab:Python] pywebviewFullPath does not exist: {path!r}")
+                            logger.debug("pywebviewFullPath does not exist: %r", path)
                 else:
-                    print(f"[SyncLab:Python] file[{i}] is not a dict: {type(f)}")
+                    logger.debug("file[%d] is not a dict: %s", i, type(f))
         else:
-            print(f"[SyncLab:Python] Event is not a dict: {type(e)}")
+            logger.debug("Event is not a dict: %s", type(e))
 
         # Strategy 2: Check _dnd_state directly (bypass pywebviewFullPath injection)
         if not folder:
             try:
                 from webview.dom import _dnd_state
                 paths = _dnd_state.get('paths', [])
-                print(f"[SyncLab:Python] _dnd_state paths: {paths}")
+                logger.debug("_dnd_state paths: %s", paths)
 
                 if paths:
                     for entry in paths:
@@ -318,12 +321,12 @@ def _make_drop_handler(window, target_type):
 
                         if os.path.exists(candidate):
                             folder = candidate if os.path.isdir(candidate) else str(Path(candidate).parent)
-                            print(f"[SyncLab:Python] Resolved via _dnd_state: {folder}")
+                            logger.debug("Resolved via _dnd_state: %s", folder)
                             break
             except ImportError:
-                print("[SyncLab:Python] Could not import _dnd_state")
+                logger.debug("Could not import _dnd_state")
             except Exception as ex:
-                print(f"[SyncLab:Python] _dnd_state check failed: {ex}")
+                logger.debug("_dnd_state check failed: %s", ex)
 
         # Strategy 3: Try WinForms-level DragDrop data
         if not folder:
@@ -331,14 +334,14 @@ def _make_drop_handler(window, target_type):
 
         # Push result to JS
         if folder:
-            print(f"[SyncLab:Python] OK - Pushing folder to JS: {folder}")
+            logger.info("OK - Pushing folder to JS: %s", folder)
             try:
                 js = f"handleNativeDrop({json.dumps(target_type)}, {json.dumps(folder)})"
                 window.evaluate_js(js)
             except Exception as ex:
-                print(f"[SyncLab:Python] evaluate_js error: {ex}")
+                logger.warning("evaluate_js error: %s", ex)
         else:
-            print(f"[SyncLab:Python] FAIL - No folder resolved from drop event")
+            logger.warning("FAIL - No folder resolved from drop event")
             # Notify JS that native drop failed (JS can show warning)
             try:
                 window.evaluate_js(
@@ -353,4 +356,6 @@ def _make_drop_handler(window, target_type):
 
 
 if __name__ == "__main__":
+    from synclab.logging_config import setup_logging
+    setup_logging()
     main()

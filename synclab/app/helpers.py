@@ -10,9 +10,12 @@ Dependencies: pathlib, subprocess (for folder dialog only).
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +228,7 @@ Write-Output ([FolderPicker]::Pick())
             return ""
         # Non-zero return code: fall through to fallback
     except Exception as e:
-        print(f"[SyncLab] Modern dialog error: {e}")
+        logger.debug("Modern dialog error: %s", e)
 
     # Fallback: basic FolderBrowserDialog (tree-style)
     try:
@@ -244,5 +247,5 @@ Write-Output ([FolderPicker]::Pick())
         )
         return result.stdout.strip()
     except Exception as e:
-        print(f"[SyncLab] Fallback dialog error: {e}")
+        logger.debug("Fallback dialog error: %s", e)
         return ""
