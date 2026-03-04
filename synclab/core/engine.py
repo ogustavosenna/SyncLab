@@ -17,6 +17,15 @@ v1.1 additions:
   - Spectral whitening: reduces microphone signature differences
   - Diagnostics: per-stage records for debugging sync failures
 
+v1.3.0 refactoring:
+  - DSP helpers extracted to dsp.py (parabolic_interpolation,
+    compute_peak_ratio, compute_envelope, extract_slices,
+    multi_slice_consensus).
+  - Cross-correlation functions extracted to xcorr.py (xcorr,
+    xcorr_windowed, xcorr_envelope, xcorr_envelope_windowed).
+  - SyncEngine remains the orchestrator with thin wrappers for
+    backward compatibility.
+
 Dependencies: numpy, scipy (only).
 """
 
@@ -27,7 +36,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
-from scipy import signal
 
 from synclab.core.audio import (
     extract_wav,
@@ -36,6 +44,17 @@ from synclab.core.audio import (
     safe_remove,
     compute_speech_ratio,
     spectral_whiten,
+)
+from synclab.core.dsp import (
+    compute_envelope,
+    extract_slices,
+    multi_slice_consensus,
+)
+from synclab.core.xcorr import (
+    xcorr,
+    xcorr_windowed,
+    xcorr_envelope,
+    xcorr_envelope_windowed,
 )
 
 # Type alias for the progress callback: (stage_name, detail_text) -> None
@@ -208,84 +227,81 @@ class SyncEngine:
         self._zoom_cache.clear()
 
     # ------------------------------------------------------------------
-    # Multi-slice extraction (v1.1)
+    # Wrappers — delegate to module-level functions in dsp.py / xcorr.py
+    #
+    # These thin wrappers maintain backward compatibility so that
+    # sync_with_zoom() and tests can continue calling self._xcorr()
+    # etc. without changes.
     # ------------------------------------------------------------------
 
     def _extract_slices(
         self,
         cam_bp: np.ndarray,
     ) -> List[tuple[np.ndarray, int]]:
-        """Extract multi-slice segments from camera audio.
-
-        Returns list of (slice_data, start_sample) tuples for
-        beginning, middle, and end of the recording.
-        """
+        """Extract multi-slice segments from camera audio."""
         count = int(self.config.get("multi_slice_count", 3))
         dur = int(self.config.get("multi_slice_duration", 20))
-        slice_samples = dur * self.sr
-        total = len(cam_bp)
-
-        if total <= slice_samples:
-            return [(cam_bp, 0)]
-
-        slices = []
-        # Beginning
-        slices.append((cam_bp[:slice_samples], 0))
-        # Middle
-        mid_start = (total - slice_samples) // 2
-        slices.append((cam_bp[mid_start:mid_start + slice_samples], mid_start))
-        # End
-        end_start = total - slice_samples
-        slices.append((cam_bp[end_start:], end_start))
-
-        return slices[:count]
+        return extract_slices(cam_bp, self.sr, count, dur)
 
     def _multi_slice_consensus(
         self,
         results: List[tuple[float, float, float]],
         tolerance: float = 0.5,
     ) -> tuple[float, float, float]:
-        """Find consensus offset from multiple slices.
+        """Find consensus offset from multiple slices."""
+        return multi_slice_consensus(results, tolerance)
 
-        Parameters
-        ----------
-        results : list of (offset, confidence, peak_ratio) tuples
-        tolerance : float
-            Maximum disagreement in seconds between two slices
-            to consider them "agreeing".
+    def _xcorr(
+        self,
+        cam: np.ndarray,
+        zoom: np.ndarray,
+    ) -> tuple[float, float, float]:
+        """Normalised cross-correlation: find *cam* inside *zoom*."""
+        return xcorr(cam, zoom, self.sr)
 
-        Returns
-        -------
-        (offset, confidence, peak_ratio) : the consensus result.
-            If 2+ slices agree within tolerance, returns the average
-            offset, max confidence, and max peak_ratio of the group.
-            Otherwise, returns the single best result by confidence.
-        """
-        if len(results) <= 1:
-            return results[0] if results else (0.0, 0.0, 0.0)
+    def _xcorr_windowed(
+        self,
+        cam: np.ndarray,
+        zoom: np.ndarray,
+        predicted_offset: float,
+        window_sec: Optional[float] = None,
+    ) -> tuple[float, float, float]:
+        """Cross-correlation in a window around *predicted_offset*."""
+        if window_sec is None:
+            window_sec = self.config.get("sync_window_sec", 30)
+        return xcorr_windowed(cam, zoom, self.sr, predicted_offset, window_sec)
 
-        best_group: List[tuple[float, float, float]] = []
-        best_group_conf = 0.0
+    def _compute_envelope(
+        self,
+        data: np.ndarray,
+        hop: int = 200,
+    ) -> np.ndarray:
+        """Compute the RMS amplitude envelope of *data*."""
+        return compute_envelope(data, hop)
 
-        for i in range(len(results)):
-            group = [results[i]]
-            for j in range(len(results)):
-                if i != j and abs(results[i][0] - results[j][0]) <= tolerance:
-                    group.append(results[j])
-            if len(group) >= 2:
-                max_conf = max(r[1] for r in group)
-                if max_conf > best_group_conf:
-                    best_group = group
-                    best_group_conf = max_conf
+    def _xcorr_envelope(
+        self,
+        cam: np.ndarray,
+        zoom: np.ndarray,
+        hop: int = 200,
+    ) -> tuple[float, float, float]:
+        """Cross-correlate amplitude envelopes."""
+        return xcorr_envelope(cam, zoom, self.sr, hop)
 
-        if best_group:
-            avg_off = sum(r[0] for r in best_group) / len(best_group)
-            max_conf = max(r[1] for r in best_group)
-            max_pr = max(r[2] for r in best_group)
-            return avg_off, max_conf, max_pr
-
-        # No consensus: return the slice with highest confidence
-        return max(results, key=lambda r: r[1])
+    def _xcorr_envelope_windowed(
+        self,
+        cam: np.ndarray,
+        zoom: np.ndarray,
+        predicted_offset: float,
+        window_sec: Optional[float] = None,
+        hop: int = 200,
+    ) -> tuple[float, float, float]:
+        """Windowed envelope cross-correlation around *predicted_offset*."""
+        if window_sec is None:
+            window_sec = self.config.get("sync_window_sec", 30)
+        return xcorr_envelope_windowed(
+            cam, zoom, self.sr, predicted_offset, window_sec, hop,
+        )
 
     # ------------------------------------------------------------------
     # Main sync algorithm (4 stages)
@@ -634,333 +650,3 @@ class SyncEngine:
         best["speech_ratio"] = speech_ratio
         best["diagnostics"] = diagnostics
         return best
-
-    # ------------------------------------------------------------------
-    # Raw FFT cross-correlation with parabolic interpolation
-    # ------------------------------------------------------------------
-
-    def _xcorr(
-        self,
-        cam: np.ndarray,
-        zoom: np.ndarray,
-    ) -> tuple[float, float, float]:
-        """Normalised cross-correlation: find *cam* inside *zoom*.
-
-        Uses ``scipy.signal.fftconvolve`` for O(n log n) performance.
-        A parabolic (3-point) interpolation around the peak yields
-        sub-sample precision.
-
-        Parameters
-        ----------
-        cam : ndarray
-            Camera audio signal.
-        zoom : ndarray
-            Zoom (external recorder) audio signal.
-
-        Returns
-        -------
-        offset_seconds : float
-            Positive means the camera starts at position *offset* inside
-            the Zoom recording.
-        confidence : float
-            Peak of the normalised correlation (0--1).
-        peak_ratio : float
-            Ratio of highest peak to second-highest peak.  Higher values
-            indicate a more distinct (less ambiguous) match.
-        """
-        cam = np.asarray(cam, dtype=np.float64)
-        zoom = np.asarray(zoom, dtype=np.float64)
-
-        # Zero-mean
-        cam = cam - np.mean(cam)
-        zoom = zoom - np.mean(zoom)
-
-        # Check energy
-        std_c = np.std(cam)
-        std_z = np.std(zoom)
-        if std_c < 1e-10 or std_z < 1e-10:
-            return 0.0, 0.0, 0.0
-
-        # Normalised cross-correlation via FFT
-        corr = signal.fftconvolve(zoom, cam[::-1], mode="full")
-        corr = corr / (len(cam) * std_c * std_z)
-
-        # Find peak
-        pk = int(np.argmax(corr))
-        conf = float(corr[pk])
-        offset_samp = float(pk - (len(cam) - 1))
-
-        # Parabolic interpolation for sub-sample accuracy
-        if 0 < pk < len(corr) - 1:
-            y0 = float(corr[pk - 1])
-            y1 = float(corr[pk])
-            y2 = float(corr[pk + 1])
-            denom = 2.0 * (2 * y1 - y0 - y2)
-            if abs(denom) > 1e-10:
-                delta = (y0 - y2) / denom
-                offset_samp += delta
-
-        # -- Peak-to-second-peak ratio (v1.1) --
-        peak_ratio = float("inf")
-        if len(corr) > 10:
-            min_gap = max(int(0.5 * self.sr), 1)
-            corr_copy = corr.copy()
-            mask_start = max(0, pk - min_gap)
-            mask_end = min(len(corr_copy), pk + min_gap)
-            corr_copy[mask_start:mask_end] = 0.0
-            pk2 = int(np.argmax(corr_copy))
-            conf2 = float(corr_copy[pk2])
-            if conf2 > 1e-10:
-                peak_ratio = conf / conf2
-
-        return offset_samp / self.sr, max(conf, 0.0), peak_ratio
-
-    # ------------------------------------------------------------------
-    # Windowed cross-correlation
-    # ------------------------------------------------------------------
-
-    def _xcorr_windowed(
-        self,
-        cam: np.ndarray,
-        zoom: np.ndarray,
-        predicted_offset: float,
-        window_sec: Optional[float] = None,
-    ) -> tuple[float, float, float]:
-        """Cross-correlation in a window around *predicted_offset*.
-
-        Extracts a segment of the Zoom audio centred on the predicted
-        offset and runs :meth:`_xcorr` on that segment.  The returned
-        offset is expressed in global Zoom time.
-
-        Parameters
-        ----------
-        cam : ndarray
-            Camera audio signal.
-        zoom : ndarray
-            Full Zoom audio signal.
-        predicted_offset : float
-            Expected offset in seconds.
-        window_sec : float or None
-            Half-width of the search window.  Defaults to
-            ``config["sync_window_sec"]`` (typically 30 s).
-
-        Returns
-        -------
-        offset_global : float
-            Offset in seconds relative to the start of *zoom*.
-        confidence : float
-            Peak normalised correlation.
-        peak_ratio : float
-            Peak distinctness ratio.
-        """
-        if window_sec is None:
-            window_sec = self.config.get("sync_window_sec", 30)
-
-        sr = self.sr
-        cam_dur_sec = len(cam) / sr
-
-        # Window boundaries in the Zoom signal
-        win_start = max(0, int((predicted_offset - window_sec) * sr))
-        win_end = min(
-            len(zoom),
-            int((predicted_offset + cam_dur_sec + window_sec) * sr),
-        )
-
-        if win_end <= win_start:
-            return 0.0, 0.0, 0.0
-
-        zoom_win = zoom[win_start:win_end]
-        if len(zoom_win) < len(cam) // 2:
-            return 0.0, 0.0, 0.0
-
-        # Cross-correlation inside the window
-        offset_local, conf, peak_ratio = self._xcorr(cam, zoom_win)
-
-        # Convert local offset to global (relative to Zoom start)
-        offset_global = offset_local + (win_start / sr)
-        return offset_global, conf, peak_ratio
-
-    # ------------------------------------------------------------------
-    # Envelope computation (RMS amplitude)
-    # ------------------------------------------------------------------
-
-    def _compute_envelope(
-        self,
-        data: np.ndarray,
-        hop: int = 200,
-    ) -> np.ndarray:
-        """Compute the RMS amplitude envelope of *data*.
-
-        At the default analysis rate of 8 kHz, a hop of 200 samples
-        gives 25 ms frames -- capturing *when* there is energy (speech
-        vs. silence) rather than frequency content.  This makes the
-        envelope robust across different microphones recording the same
-        acoustic event.
-
-        Parameters
-        ----------
-        data : ndarray
-            Audio signal.
-        hop : int
-            Frame length in samples.
-
-        Returns
-        -------
-        ndarray
-            RMS amplitude per frame.
-        """
-        n = len(data) // hop
-        if n < 2:
-            return np.array([np.sqrt(np.mean(data**2))])
-        frames = data[: n * hop].reshape(n, hop)
-        return np.sqrt(np.mean(frames**2, axis=1))
-
-    # ------------------------------------------------------------------
-    # Envelope cross-correlation
-    # ------------------------------------------------------------------
-
-    def _xcorr_envelope(
-        self,
-        cam: np.ndarray,
-        zoom: np.ndarray,
-        hop: int = 200,
-    ) -> tuple[float, float, float]:
-        """Cross-correlate amplitude envelopes.
-
-        More robust than raw sample-level cross-correlation when the
-        camera and external recorder use different microphones (different
-        frequency responses, noise floors, etc.).
-
-        Parameters
-        ----------
-        cam : ndarray
-            Camera audio.
-        zoom : ndarray
-            Zoom audio.
-        hop : int
-            Envelope frame size in samples.
-
-        Returns
-        -------
-        offset_seconds : float
-            Time offset in seconds.
-        confidence : float
-            Peak normalised correlation.
-        peak_ratio : float
-            Peak distinctness ratio.
-        """
-        env_c = self._compute_envelope(cam, hop)
-        env_z = self._compute_envelope(zoom, hop)
-
-        if len(env_c) < 2 or len(env_z) < 2:
-            return 0.0, 0.0, 0.0
-
-        env_c = env_c.astype(np.float64)
-        env_z = env_z.astype(np.float64)
-        env_c = env_c - np.mean(env_c)
-        env_z = env_z - np.mean(env_z)
-
-        std_c = np.std(env_c)
-        std_z = np.std(env_z)
-        if std_c < 1e-10 or std_z < 1e-10:
-            return 0.0, 0.0, 0.0
-
-        corr = signal.fftconvolve(env_z, env_c[::-1], mode="full")
-        corr = corr / (len(env_c) * std_c * std_z)
-
-        pk = int(np.argmax(corr))
-        conf = float(corr[pk])
-        offset_frames = float(pk - (len(env_c) - 1))
-
-        # Parabolic interpolation for sub-frame precision
-        if 0 < pk < len(corr) - 1:
-            y0 = float(corr[pk - 1])
-            y1 = float(corr[pk])
-            y2 = float(corr[pk + 1])
-            denom = 2.0 * (2 * y1 - y0 - y2)
-            if abs(denom) > 1e-10:
-                delta = (y0 - y2) / denom
-                offset_frames += delta
-
-        # -- Peak-to-second-peak ratio (v1.1) --
-        peak_ratio = float("inf")
-        if len(corr) > 10:
-            # Envelope operates at reduced sample rate (sr / hop)
-            env_sr = self.sr / hop
-            min_gap = max(int(0.5 * env_sr), 1)
-            corr_copy = corr.copy()
-            mask_start = max(0, pk - min_gap)
-            mask_end = min(len(corr_copy), pk + min_gap)
-            corr_copy[mask_start:mask_end] = 0.0
-            pk2 = int(np.argmax(corr_copy))
-            conf2 = float(corr_copy[pk2])
-            if conf2 > 1e-10:
-                peak_ratio = conf / conf2
-
-        offset_sec = offset_frames * hop / self.sr
-        return offset_sec, max(conf, 0.0), peak_ratio
-
-    # ------------------------------------------------------------------
-    # Windowed envelope cross-correlation
-    # ------------------------------------------------------------------
-
-    def _xcorr_envelope_windowed(
-        self,
-        cam: np.ndarray,
-        zoom: np.ndarray,
-        predicted_offset: float,
-        window_sec: Optional[float] = None,
-        hop: int = 200,
-    ) -> tuple[float, float, float]:
-        """Windowed envelope cross-correlation around *predicted_offset*.
-
-        Combines the robustness of envelope correlation with the
-        efficiency of a limited search window.
-
-        Parameters
-        ----------
-        cam : ndarray
-            Camera audio (full).
-        zoom : ndarray
-            Zoom audio (full).
-        predicted_offset : float
-            Expected offset in seconds.
-        window_sec : float or None
-            Half-width of the window (defaults to
-            ``config["sync_window_sec"]``).
-        hop : int
-            Envelope frame size in samples.
-
-        Returns
-        -------
-        offset_global : float
-            Offset in seconds relative to the start of *zoom*.
-        confidence : float
-            Peak normalised correlation of the envelopes.
-        peak_ratio : float
-            Peak distinctness ratio.
-        """
-        if window_sec is None:
-            window_sec = self.config.get("sync_window_sec", 30)
-
-        sr = self.sr
-        cam_dur_sec = len(cam) / sr
-
-        win_start = max(0, int((predicted_offset - window_sec) * sr))
-        win_end = min(
-            len(zoom),
-            int((predicted_offset + cam_dur_sec + window_sec) * sr),
-        )
-
-        if win_end <= win_start:
-            return 0.0, 0.0, 0.0
-
-        zoom_win = zoom[win_start:win_end]
-        if len(zoom_win) < len(cam) // 2:
-            return 0.0, 0.0, 0.0
-
-        offset_local, conf, peak_ratio = self._xcorr_envelope(
-            cam, zoom_win, hop,
-        )
-        offset_global = offset_local + (win_start / sr)
-        return offset_global, conf, peak_ratio

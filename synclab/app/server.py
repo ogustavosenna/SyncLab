@@ -1,13 +1,19 @@
 """
 SyncLab App - Flask Backend Server
 REST API + WebSocket for real-time progress updates.
+
+v1.3.0 refactoring:
+  - Helper functions extracted to helpers.py
+    (compute_confidence_badge, serialize_timeline, serialize_value,
+    win32_browse_folder)
+  - Background sync runner extracted to sync_runner.py
+  - This module retains create_app() with route definitions
 """
 
 import os
 import sys
 import json
 import time
-import shutil
 import tempfile
 import threading
 import zipfile
@@ -21,9 +27,21 @@ from synclab.settings import load_settings, save_settings
 from synclab.dependencies import check_ffmpeg, get_system_info
 from synclab.subprocess_utils import subprocess_hide_window
 from synclab.scanner.scanner import scan_folders
-from synclab.core.engine import SyncEngine
-from synclab.core.matcher import SmartMatcher
 from synclab.export.premiere_xml import PremiereXMLGenerator
+from synclab.app.helpers import (
+    compute_confidence_badge,
+    serialize_timeline,
+    serialize_value,
+    win32_browse_folder,
+)
+from synclab.app.sync_runner import run_sync
+
+# Backward-compatible aliases (used by tests and external code)
+_compute_confidence_badge = compute_confidence_badge
+_serialize_timeline = serialize_timeline
+_serialize_value = serialize_value
+_win32_browse_folder = win32_browse_folder
+_run_sync = run_sync
 
 
 def _get_base_path():
@@ -31,131 +49,6 @@ def _get_base_path():
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         return Path(sys._MEIPASS) / "synclab" / "app"
     return Path(__file__).parent
-
-
-def _win32_browse_folder():
-    """Windows modern folder dialog (Explorer-style) via COM IFileDialog.
-
-    Uses PowerShell with inline C# to create an IFileOpenDialog with
-    FOS_PICKFOLDERS flag.  This gives the full Windows Explorer-style
-    folder picker instead of the legacy FolderBrowserDialog tree view.
-    Falls back to the basic dialog if COM compilation fails.
-
-    Returns selected folder path as string, or empty string on cancel/error.
-    """
-    import subprocess as sp
-    import base64
-
-    # Modern Explorer-style dialog via COM IFileDialog + C# interop
-    ps_code = r'''
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-[ComImport, Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
-class FileOpenDialogRCW { }
-
-[ComImport, Guid("42F85136-DB7E-439C-85F1-E4075D135FC8"),
- InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IFileDialog {
-    [PreserveSig] int Show(IntPtr hwndOwner);
-    void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
-    void SetFileTypeIndex(uint iFileType);
-    void GetFileTypeIndex(out uint piFileType);
-    void Advise(IntPtr pfde, out uint pdwCookie);
-    void Unadvise(uint dwCookie);
-    void SetOptions(uint fos);
-    void GetOptions(out uint pfos);
-    void SetDefaultFolder(IShellItem psi);
-    void SetFolder(IShellItem psi);
-    void GetFolder(out IShellItem ppsi);
-    void GetCurrentSelection(out IShellItem ppsi);
-    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
-    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
-    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
-    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
-    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
-    void GetResult(out IShellItem ppsi);
-    void AddPlace(IShellItem psi, int fdap);
-    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
-    void Close(int hr);
-    void SetClientGuid(ref Guid guid);
-    void ClearClientData();
-    void SetFilter(IntPtr pFilter);
-}
-
-[ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
- InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IShellItem {
-    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
-    void GetParent(out IShellItem ppsi);
-    void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
-    void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
-    void Compare(IShellItem psi, uint hint, out int piOrder);
-}
-
-public class FolderPicker {
-    public static string Pick() {
-        IFileDialog dialog = (IFileDialog)new FileOpenDialogRCW();
-        try {
-            uint options;
-            dialog.GetOptions(out options);
-            dialog.SetOptions(options | 0x20 | 0x40);
-            dialog.SetTitle("Select Folder");
-            int hr = dialog.Show(IntPtr.Zero);
-            if (hr != 0) return "";
-            IShellItem item;
-            dialog.GetResult(out item);
-            string path;
-            item.GetDisplayName(0x80058000, out path);
-            return path ?? "";
-        }
-        catch { return ""; }
-        finally { Marshal.ReleaseComObject(dialog); }
-    }
-}
-"@
-
-Write-Output ([FolderPicker]::Pick())
-'''
-
-    try:
-        encoded = base64.b64encode(ps_code.encode('utf-16-le')).decode('ascii')
-        result = sp.run(
-            ['powershell', '-NoProfile', '-NonInteractive',
-             '-EncodedCommand', encoded],
-            capture_output=True, text=True, timeout=120,
-            **subprocess_hide_window(),
-        )
-        folder = result.stdout.strip()
-        if folder:
-            return folder
-        # Empty output + returncode 0 means user cancelled
-        if result.returncode == 0:
-            return ""
-        # Non-zero return code: fall through to fallback
-    except Exception as e:
-        print(f"[SyncLab] Modern dialog error: {e}")
-
-    # Fallback: basic FolderBrowserDialog (tree-style)
-    try:
-        ps_fallback = (
-            'Add-Type -AssemblyName System.Windows.Forms;'
-            '$d = New-Object System.Windows.Forms.FolderBrowserDialog;'
-            '$d.Description = "Select Folder";'
-            '$d.ShowNewFolderButton = $true;'
-            'if ($d.ShowDialog() -eq "OK") { Write-Output $d.SelectedPath }'
-        )
-        result = sp.run(
-            ['powershell', '-NoProfile', '-NonInteractive',
-             '-Command', ps_fallback],
-            capture_output=True, text=True, timeout=120,
-            **subprocess_hide_window(),
-        )
-        return result.stdout.strip()
-    except Exception as e:
-        print(f"[SyncLab] Fallback dialog error: {e}")
-        return ""
 
 
 def create_app():
@@ -435,7 +328,6 @@ def create_app():
     def open_folder():
         """Open a folder in the OS file explorer, selecting the file if given."""
         import subprocess as sp
-        import sys
 
         data = request.get_json() or {}
         file_path = data.get("path", "")
@@ -566,240 +458,3 @@ def create_app():
         state["syncing"] = False
 
     return app, socketio
-
-
-def _run_sync(state, socketio, output_dir):
-    """Run synchronization in a background thread."""
-    try:
-        config = state["config"]
-        videos = state["videos"]
-        audio_groups = state["audio_groups"]
-
-        total_videos = len(videos)
-        total_audio = len(audio_groups)
-
-        # Create temp directory
-        temp_dir = Path(tempfile.mkdtemp(prefix="synclab_"))
-
-        # Phase weight ranges for overall progress bar
-        # Metadata + timestamp are fast (~4%), audio sync is the real work (~88%)
-        PHASE_RANGES = {
-            "metadata": (0, 2),
-            "timestamp_calibration": (2, 4),
-            "audio_sync": (4, 92),
-            "brute_force": (92, 99),
-            "done": (100, 100),
-        }
-
-        def emit_progress(event_type, data):
-            """Transform matcher events into frontend-compatible format.
-
-            OVERALL progress: steady climb from 0-100% across all phases.
-            STEP progress: per-video indicator (frontend animates per-video
-            cycling so the two bars show clearly different information).
-            """
-            if not state["syncing"]:
-                raise InterruptedError("Sync cancelled by user")
-
-            if event_type == "phase":
-                # Matcher uses "name", frontend expects "phase"
-                phase_name = data.get("name", "")
-                low, _ = PHASE_RANGES.get(phase_name, (0, 0))
-                socketio.emit("phase", {
-                    "phase": phase_name,
-                    "description": data.get("description", ""),
-                    "percent": low,
-                })
-
-            elif event_type == "progress":
-                vi = data.get("video_index", -1)
-                phase = data.get("phase", "audio_sync")
-                detail = data.get("detail", "")
-
-                # --- OVERALL: phase-weighted total progress ---
-                low, high = PHASE_RANGES.get(phase, (0, 100))
-
-                if phase == "brute_force":
-                    # Use brute-force-local index for accurate progress
-                    bf_idx = data.get("bf_index", 0)
-                    bf_total = data.get("bf_total", 1)
-                    if bf_total > 0:
-                        overall_pct = low + (high - low) * (bf_idx + 1) / bf_total
-                    else:
-                        overall_pct = low
-                    overall_detail = (
-                        f"Extra pass — Unassigned video "
-                        f"{bf_idx + 1} of {bf_total}"
-                    )
-                elif vi >= 0 and total_videos > 0:
-                    video_pct = (vi + 1) / total_videos
-                    overall_pct = low + (high - low) * video_pct
-                    if phase == "audio_sync":
-                        overall_detail = (
-                            f"Phase 3 — Video {vi + 1} of {total_videos}"
-                        )
-                    else:
-                        overall_detail = detail
-                else:
-                    overall_pct = low
-                    # Show phase name for metadata/timestamp phases
-                    if phase == "metadata":
-                        overall_detail = f"Phase 1 — {detail}"
-                    elif phase == "timestamp_calibration":
-                        overall_detail = f"Phase 2 — {detail}"
-                    else:
-                        overall_detail = detail
-
-                # --- STEP: clean detail for per-video display ---
-                # Remove "[X/Y] " prefix from matcher detail strings
-                step_detail = detail
-                if detail.startswith("[") and "] " in detail:
-                    step_detail = detail.split("] ", 1)[1]
-
-                socketio.emit("progress", {
-                    "overall_percent": round(overall_pct),
-                    "overall_detail": overall_detail,
-                    "video_index": vi,
-                    "step_detail": step_detail,
-                })
-
-            elif event_type == "match":
-                # Add type field and normalize field names for frontend
-                match_data = dict(data)
-                method = match_data.get("method", "")
-                conf = match_data.get("confidence", 0)
-                if conf > 0 or "timestamp" in method:
-                    match_data["type"] = "synced"
-                else:
-                    match_data["type"] = "video_only"
-                match_data["video_name"] = match_data.pop("video", "")
-                match_data["audio_name"] = match_data.pop("audio", "")
-                # Add confidence badge (v1.1)
-                match_data["badge"] = _compute_confidence_badge(match_data)
-                socketio.emit("match", match_data)
-
-            else:
-                socketio.emit(event_type, data)
-
-        # Emit start
-        emit_progress("sync_started", {
-            "total_videos": total_videos,
-            "total_audio_groups": total_audio,
-        })
-
-        # Create engine and matcher
-        engine = SyncEngine(config)
-        matcher = SmartMatcher(engine, config)
-
-        # Run matching
-        timeline = matcher.match(
-            videos,
-            audio_groups,
-            temp_dir,
-            progress_callback=emit_progress,
-        )
-
-        # Count results
-        synced_audio = sum(
-            1 for item in timeline
-            if item.get("type") == "synced"
-            and item.get("method", "") != "timestamp_only"
-        )
-        synced_ts = sum(
-            1 for item in timeline
-            if item.get("type") == "synced"
-            and item.get("method", "") == "timestamp_only"
-        )
-        video_only = sum(1 for item in timeline if item.get("type") == "video_only")
-        audio_only = sum(1 for item in timeline if item.get("type") == "audio_only")
-
-        # Serialize timeline for JSON
-        serialized = _serialize_timeline(timeline)
-
-        results = {
-            "timeline": timeline,
-            "summary": {
-                "total_videos": total_videos,
-                "total_audio_groups": total_audio,
-                "synced_audio": synced_audio,
-                "synced_timestamp": synced_ts,
-                "video_only": video_only,
-                "audio_only": audio_only,
-            },
-            "serialized": serialized,
-        }
-
-        state["results"] = results
-
-        emit_progress("sync_complete", results["summary"])
-
-    except InterruptedError:
-        socketio.emit("sync_cancelled", {})
-    except Exception as e:
-        socketio.emit("sync_error", {"message": str(e)})
-    finally:
-        state["syncing"] = False
-        # Clean up temp directory
-        try:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-def _compute_confidence_badge(item):
-    """Compute a confidence badge color for a timeline item.
-
-    Returns:
-        "high" (green): conf >= 0.30 AND peak_ratio >= 2.0
-        "medium" (yellow): conf >= 0.10 OR (conf >= 0.05 AND peak_ratio >= 1.5)
-        "low" (red): everything else (including timestamp_only, vad_skip)
-    """
-    conf = item.get("confidence", 0.0)
-    peak_ratio = item.get("peak_ratio") or 0.0
-    method = item.get("method", "")
-
-    # Timestamp-only and non-audio methods are always low
-    if method in ("timestamp_only", "timestamp_fallback", "n/a", "vad_skip"):
-        return "low"
-
-    if conf >= 0.30 and peak_ratio >= 2.0:
-        return "high"
-    if conf >= 0.10 or (conf >= 0.05 and peak_ratio >= 1.5):
-        return "medium"
-    return "low"
-
-
-def _serialize_timeline(timeline):
-    """Serialize timeline items for JSON transport."""
-    items = []
-    for item in timeline:
-        serialized = {}
-        for key, value in item.items():
-            if key == "diagnostics":
-                # Include diagnostics but convert Paths
-                serialized[key] = _serialize_value(value)
-            elif isinstance(value, Path):
-                serialized[key] = str(value)
-            elif isinstance(value, dict):
-                serialized[key] = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in value.items()
-                }
-            else:
-                serialized[key] = value
-        # Add confidence badge
-        serialized["badge"] = _compute_confidence_badge(item)
-        items.append(serialized)
-    return items
-
-
-def _serialize_value(value):
-    """Recursively serialize a value, converting Paths to strings."""
-    if isinstance(value, Path):
-        return str(value)
-    elif isinstance(value, dict):
-        return {k: _serialize_value(v) for k, v in value.items()}
-    elif isinstance(value, (list, tuple)):
-        return [_serialize_value(v) for v in value]
-    return value

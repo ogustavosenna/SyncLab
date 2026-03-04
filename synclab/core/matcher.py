@@ -12,15 +12,36 @@ Algorithm overview:
 The matcher accepts a generic project structure: a list of video dicts
 and a list of audio group dicts. No assumptions are made about folder
 naming conventions or project-specific layout.
+
+v1.3.0 refactoring:
+  - Metadata extraction moved to metadata.py
+  - Clock calibration and assignment moved to calibration.py
+  - Timeline construction moved to timeline.py
+  - SmartMatcher remains the orchestrator with thin wrappers
+    for backward compatibility.
 """
 
-import json
-import datetime
-import subprocess
 from pathlib import Path
 
-from synclab.core.audio import format_duration, safe_remove, classify_track
+from synclab.core.audio import format_duration, safe_remove
 from synclab.core.media import get_media_info
+from synclab.core.metadata import (
+    get_video_creation_time,
+    get_recorder_time_range,
+    classify_wav_files,
+)
+from synclab.core.calibration import (
+    valid_offset,
+    calibrate_clock_offset,
+    calibrate_subset,
+    timestamp_assign,
+    timestamp_assign_subset,
+)
+from synclab.core.timeline import (
+    audio_only_item,
+    video_only_item,
+    build_timeline,
+)
 
 
 class SmartMatcher:
@@ -49,540 +70,78 @@ class SmartMatcher:
         self.config = config
 
     # ------------------------------------------------------------------
-    # Offset validation
+    # Wrappers — delegate to module-level functions
+    #
+    # These maintain backward compatibility so that tests and any
+    # external code calling self._method() continue to work.
     # ------------------------------------------------------------------
 
     def _valid_offset(self, offset, video_duration, recorder_duration):
-        """Check whether offset places the video within the recorder range.
-
-        Args:
-            offset: Computed offset in seconds (video start within recorder).
-            video_duration: Duration of the video in seconds.
-            recorder_duration: Duration of the recorder audio in seconds.
-
-        Returns:
-            True if the offset is plausible, False otherwise.
-        """
-        if recorder_duration <= 0 or video_duration <= 0:
-            return True
-        cam_len = min(video_duration, self.config.get("max_camera_sec", 60))
-        if offset < -30:
-            return False
-        if offset > recorder_duration:
-            return False
-        if offset > 0 and offset + cam_len > recorder_duration + 15:
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    # Timestamp extraction
-    # ------------------------------------------------------------------
+        """Check whether offset places the video within the recorder range."""
+        max_cam = self.config.get("max_camera_sec", 60)
+        return valid_offset(offset, video_duration, recorder_duration, max_cam)
 
     def _get_video_creation_time(self, video_path):
-        """Extract creation_time from video metadata, with filesystem fallback.
-
-        Priority:
-          1. ffprobe creation_time tag (most reliable, embedded in container)
-          2. Filesystem creation time (st_ctime on Windows)
-          3. Filesystem modification time (st_mtime, last resort)
-
-        Args:
-            video_path: Path to the video file.
-
-        Returns:
-            datetime object or None if unavailable.
-        """
-        # Priority 1: ffprobe creation_time tag
-        try:
-            from synclab.subprocess_utils import subprocess_hide_window
-            r = subprocess.run(
-                [
-                    "ffprobe", "-v", "quiet",
-                    "-print_format", "json",
-                    "-show_format", str(video_path),
-                ],
-                capture_output=True, text=True, timeout=15,
-                **subprocess_hide_window(),
-            )
-            data = json.loads(r.stdout)
-            ct = data.get("format", {}).get("tags", {}).get("creation_time", "")
-            if ct:
-                return datetime.datetime.fromisoformat(
-                    ct.replace("Z", "+00:00")
-                )
-        except Exception:
-            pass
-
-        # Priority 2-3: Filesystem timestamps
-        try:
-            stat = Path(video_path).stat()
-            # On Windows, st_ctime is file creation time
-            ts = stat.st_ctime
-            if ts and ts > 0:
-                return datetime.datetime.fromtimestamp(ts)
-            # Last resort: modification time
-            ts = stat.st_mtime
-            if ts and ts > 0:
-                return datetime.datetime.fromtimestamp(ts)
-        except Exception:
-            pass
-
-        return None
+        """Extract creation_time from video metadata."""
+        return get_video_creation_time(video_path)
 
     def _get_recorder_time_range(self, audio_group):
-        """Get start/end times from recorder WAV file timestamps.
-
-        Prefers the main stereo mix file (containing '_LR' in the name)
-        for the most representative timestamps. Falls back to the first
-        WAV file in the group.
-
-        Args:
-            audio_group: Dict with 'wav_files' key (list of Path objects).
-
-        Returns:
-            Tuple of (start_datetime, end_datetime) or (None, None).
-        """
-        # Prefer the stereo mix file for representative timestamps
-        for wav_path in audio_group["wav_files"]:
-            if "_LR" in wav_path.name.upper():
-                stat = wav_path.stat()
-                return (
-                    datetime.datetime.fromtimestamp(stat.st_ctime),
-                    datetime.datetime.fromtimestamp(stat.st_mtime),
-                )
-        # Fallback to first WAV file
-        if audio_group["wav_files"]:
-            stat = audio_group["wav_files"][0].stat()
-            return (
-                datetime.datetime.fromtimestamp(stat.st_ctime),
-                datetime.datetime.fromtimestamp(stat.st_mtime),
-            )
-        return (None, None)
-
-    # ------------------------------------------------------------------
-    # Clock calibration (3-pass)
-    # ------------------------------------------------------------------
+        """Get start/end times from recorder WAV file timestamps."""
+        return get_recorder_time_range(audio_group)
 
     def _calibrate_clock_offset(self, video_times, recorder_times):
-        """Find the clock offset that maximizes video-recorder temporal overlap.
+        """Find the clock offset that maximizes temporal overlap."""
+        tol = self.config.get("timestamp_tolerance_sec", 15)
+        return calibrate_clock_offset(video_times, recorder_times, tol)
 
-        Cameras and external recorders often have different internal clocks.
-        This method performs a three-pass search to find the offset (in seconds)
-        that, when subtracted from video creation times, best aligns them with
-        recorder time ranges.
-
-        Pass 1: Coarse search over 0-24 h in 15-second steps.
-        Pass 2: Fine search +/-15 s around the best coarse result in 1-second steps.
-        Pass 3: Sub-second refinement +/-1 s in 0.1-second steps.
-
-        Args:
-            video_times: List of datetime objects (or None) per video.
-            recorder_times: List of (start_dt, end_dt) tuples per recorder group.
-
-        Returns:
-            Tuple of (timedelta_offset, match_count).
-            Returns (None, 0) if no valid timestamps are available.
-        """
-        valid_vt = [(i, t) for i, t in enumerate(video_times) if t is not None]
-        valid_rt = [
-            (i, s, e)
-            for i, (s, e) in enumerate(recorder_times)
-            if s and e
-        ]
-        if not valid_vt or not valid_rt:
-            return None, 0
-
-        default_tol = self.config.get("timestamp_tolerance_sec", 15)
-
-        def count_matches(offset_s, tolerance_s=default_tol):
-            offset = datetime.timedelta(seconds=offset_s)
-            tolerance = datetime.timedelta(seconds=tolerance_s)
-            count = 0
-            total_err = 0.0
-            for _vi, vtime in valid_vt:
-                adjusted = (vtime - offset).replace(tzinfo=None)
-                for _ri, rs, re_ in valid_rt:
-                    if adjusted >= rs - tolerance and adjusted <= re_ + tolerance:
-                        count += 1
-                        mid = rs + (re_ - rs) / 2
-                        total_err += abs((adjusted - mid).total_seconds())
-                        break
-            return count, total_err
-
-        # Pass 1: Coarse search -24h..+24h in 15-second steps
-        # (symmetric range handles camera clock ahead OR behind recorder)
-        best_offset_s = 0
-        best_count = 0
-        for offset_s in range(-86400, 86400, 15):
-            count, _ = count_matches(offset_s)
-            if count > best_count:
-                best_count = count
-                best_offset_s = offset_s
-
-        # Pass 2: Fine search +/-15s around best, in 1-second steps
-        fine_best_s = best_offset_s
-        fine_best_count = best_count
-        fine_best_err = float("inf")
-        for offset_s in range(best_offset_s - 15, best_offset_s + 16):
-            count, err = count_matches(offset_s)
-            if count > fine_best_count or (
-                count == fine_best_count and err < fine_best_err
-            ):
-                fine_best_count = count
-                fine_best_s = offset_s
-                fine_best_err = err
-
-        # Pass 3: Sub-second refinement +/-1s in 0.1s steps
-        ss_best_sec = float(fine_best_s)
-        ss_best_count = fine_best_count
-        ss_best_err = fine_best_err
-        for ds in range(-10, 11):
-            offset_sec = fine_best_s + ds / 10.0
-            count, err = count_matches(offset_sec)
-            if count > ss_best_count or (
-                count == ss_best_count and err < ss_best_err
-            ):
-                ss_best_count = count
-                ss_best_sec = offset_sec
-                ss_best_err = err
-
-        return datetime.timedelta(seconds=ss_best_sec), ss_best_count
-
-    # ------------------------------------------------------------------
-    # Timestamp-based pre-assignment
-    # ------------------------------------------------------------------
+    def _calibrate_subset(self, indexed_vtimes, indexed_rtimes):
+        """Calibrate clock offset for a subset of videos and recorders."""
+        tol = self.config.get("timestamp_tolerance_sec", 15)
+        return calibrate_subset(indexed_vtimes, indexed_rtimes, tol)
 
     def _timestamp_assign(self, video_times, recorder_times, clock_offset,
                           recorder_durations=None):
-        """Pre-assign each video to a recorder group based on timestamp overlap.
-
-        Using the calibrated clock offset, this method maps each video to the
-        recorder group whose time range contains the video's adjusted creation
-        time (+/- 15 s tolerance).
-
-        Args:
-            video_times: List of datetime objects (or None) per video.
-            recorder_times: List of (start_dt, end_dt) tuples per recorder group.
-            clock_offset: timedelta from _calibrate_clock_offset().
-            recorder_durations: Optional list of actual audio durations (seconds)
-                per recorder. Used for sanity check: reject if predicted offset
-                exceeds actual audio length.
-
-        Returns:
-            Dict mapping video_index -> (recorder_index, predicted_offset_seconds).
-        """
-        if clock_offset is None:
-            return {}
-        assignments = {}
-        tol_sec = self.config.get("timestamp_tolerance_sec", 15)
-        tolerance = datetime.timedelta(seconds=tol_sec)
-        for vi, vtime in enumerate(video_times):
-            if vtime is None:
-                continue
-            adjusted = (vtime - clock_offset).replace(tzinfo=None)
-            for ri, (rs, re_) in enumerate(recorder_times):
-                if rs and re_ and adjusted >= rs - tolerance and adjusted <= re_ + tolerance:
-                    offset_in_recorder = (adjusted - rs).total_seconds()
-                    # Sanity check: predicted offset must not exceed actual
-                    # audio duration (filesystem time range can be misleading)
-                    if recorder_durations and ri < len(recorder_durations):
-                        rdur = recorder_durations[ri]
-                        if rdur > 0 and offset_in_recorder > rdur + tol_sec:
-                            continue  # try next recorder
-                    assignments[vi] = (ri, offset_in_recorder)
-                    break
-        return assignments
-
-    # ------------------------------------------------------------------
-    # Multi-source calibration helpers
-    # ------------------------------------------------------------------
-
-    def _calibrate_subset(self, indexed_vtimes, indexed_rtimes):
-        """Calibrate clock offset for a subset of videos and recorders.
-
-        Like _calibrate_clock_offset but takes pre-indexed lists:
-            indexed_vtimes: [(vi, datetime_or_None), ...]
-            indexed_rtimes: [(ri, (start_dt, end_dt)), ...]
-
-        Returns:
-            (timedelta_offset, match_count) or (None, 0).
-        """
-        valid_vt = [(vi, t) for vi, t in indexed_vtimes if t is not None]
-        valid_rt = [
-            (ri, s, e) for ri, (s, e) in indexed_rtimes if s and e
-        ]
-        if not valid_vt or not valid_rt:
-            return None, 0
-
-        default_tol = self.config.get("timestamp_tolerance_sec", 15)
-
-        def count_matches(offset_s, tolerance_s=default_tol):
-            offset = datetime.timedelta(seconds=offset_s)
-            tolerance = datetime.timedelta(seconds=tolerance_s)
-            count = 0
-            total_err = 0.0
-            for _vi, vtime in valid_vt:
-                adjusted = (vtime - offset).replace(tzinfo=None)
-                for _ri, rs, re_ in valid_rt:
-                    if adjusted >= rs - tolerance and adjusted <= re_ + tolerance:
-                        count += 1
-                        mid = rs + (re_ - rs) / 2
-                        total_err += abs((adjusted - mid).total_seconds())
-                        break
-            return count, total_err
-
-        # Pass 1: Coarse search -24h..+24h in 15-second steps
-        best_offset_s = 0
-        best_count = 0
-        for offset_s in range(-86400, 86400, 15):
-            count, _ = count_matches(offset_s)
-            if count > best_count:
-                best_count = count
-                best_offset_s = offset_s
-
-        # Pass 2: Fine search +/-15s
-        fine_best_s = best_offset_s
-        fine_best_count = best_count
-        fine_best_err = float("inf")
-        for offset_s in range(best_offset_s - 15, best_offset_s + 16):
-            count, err = count_matches(offset_s)
-            if count > fine_best_count or (
-                count == fine_best_count and err < fine_best_err
-            ):
-                fine_best_count = count
-                fine_best_s = offset_s
-                fine_best_err = err
-
-        # Pass 3: Sub-second refinement
-        ss_best_sec = float(fine_best_s)
-        ss_best_count = fine_best_count
-        ss_best_err = fine_best_err
-        for ds in range(-10, 11):
-            offset_sec = fine_best_s + ds / 10.0
-            count, err = count_matches(offset_sec)
-            if count > ss_best_count or (
-                count == ss_best_count and err < ss_best_err
-            ):
-                ss_best_count = count
-                ss_best_sec = offset_sec
-                ss_best_err = err
-
-        return datetime.timedelta(seconds=ss_best_sec), ss_best_count
+        """Pre-assign videos to recorders based on timestamp overlap."""
+        tol = self.config.get("timestamp_tolerance_sec", 15)
+        return timestamp_assign(
+            video_times, recorder_times, clock_offset,
+            tol, recorder_durations,
+        )
 
     def _timestamp_assign_subset(
         self, v_indices, video_times, a_indices, recorder_times, clock_offset,
         recorder_durations=None,
     ):
-        """Assign a subset of videos to a subset of recorders using clock offset.
-
-        Args:
-            v_indices: List of video indices to consider.
-            video_times: Full list of video times (indexed by vi).
-            a_indices: List of recorder indices to consider.
-            recorder_times: Full list of recorder times (indexed by ri).
-            clock_offset: timedelta from calibration.
-            recorder_durations: Optional list of actual audio durations (seconds).
-
-        Returns:
-            Dict mapping video_index -> (recorder_index, predicted_offset_seconds).
-        """
-        assignments = {}
-        tol_sec = self.config.get("timestamp_tolerance_sec", 15)
-        tolerance = datetime.timedelta(seconds=tol_sec)
-        for vi in v_indices:
-            vtime = video_times[vi]
-            if vtime is None:
-                continue
-            adjusted = (vtime - clock_offset).replace(tzinfo=None)
-            for ri in a_indices:
-                rs, re_ = recorder_times[ri]
-                if rs and re_ and adjusted >= rs - tolerance and adjusted <= re_ + tolerance:
-                    offset_in_recorder = (adjusted - rs).total_seconds()
-                    # Sanity check: reject if offset exceeds actual audio duration
-                    if recorder_durations and ri < len(recorder_durations):
-                        rdur = recorder_durations[ri]
-                        if rdur > 0 and offset_in_recorder > rdur + tol_sec:
-                            continue
-                    assignments[vi] = (ri, offset_in_recorder)
-                    break
-        return assignments
-
-    # ------------------------------------------------------------------
-    # WAV classification helper
-    # ------------------------------------------------------------------
+        """Assign a subset of videos to a subset of recorders."""
+        tol = self.config.get("timestamp_tolerance_sec", 15)
+        return timestamp_assign_subset(
+            v_indices, video_times, a_indices, recorder_times,
+            clock_offset, tol, recorder_durations,
+        )
 
     def _classify_wav_files(self, wav_files):
-        """Classify WAV files by track type and get media info for each.
-
-        Args:
-            wav_files: List of Path objects pointing to WAV files.
-
-        Returns:
-            Dict mapping track_type string -> media info dict.
-        """
-        result = {}
-        for w in wav_files:
-            tt = classify_track(w, self.config.get("track_types", []))
-            result[tt] = get_media_info(w)
-        return result
-
-    # ------------------------------------------------------------------
-    # Timeline item builders
-    # ------------------------------------------------------------------
+        """Classify WAV files by track type and get media info."""
+        track_types = self.config.get("track_types", [])
+        return classify_wav_files(wav_files, track_types)
 
     def _audio_only_item(self, wav_by_type, audio_name, group_id):
-        """Build a timeline item for an unmatched recorder group.
-
-        Args:
-            wav_by_type: Dict of track_type -> media info.
-            audio_name: Display name for the audio group.
-            group_id: Identifier for the source group/card.
-
-        Returns:
-            Timeline item dict.
-        """
-        return {
-            "type": "audio_only",
-            "video_info": None,
-            "wav_by_type": wav_by_type,
-            "offset": 0.0,
-            "confidence": 0.0,
-            "method": "n/a",
-            "level": 0,
-            "video_name": None,
-            "audio_name": audio_name,
-            "card": group_id,
-        }
+        """Build a timeline item for an unmatched recorder group."""
+        return audio_only_item(wav_by_type, audio_name, group_id)
 
     def _video_only_item(self, video_info, video_name, group_id):
-        """Build a timeline item for an unmatched video.
-
-        Args:
-            video_info: Media info dict for the video.
-            video_name: Display name for the video file.
-            group_id: Identifier for the source group/card.
-
-        Returns:
-            Timeline item dict.
-        """
-        return {
-            "type": "video_only",
-            "video_info": video_info,
-            "wav_by_type": {},
-            "offset": 0.0,
-            "confidence": 0.0,
-            "method": "n/a",
-            "level": 0,
-            "video_name": video_name,
-            "audio_name": None,
-            "card": group_id,
-        }
-
-    # ------------------------------------------------------------------
-    # Timeline builder
-    # ------------------------------------------------------------------
+        """Build a timeline item for an unmatched video."""
+        return video_only_item(video_info, video_name, group_id)
 
     def _build_timeline(self, videos, audio_groups, video_infos,
                         audio_wav_by_type, matched_pairs, matched_recorders,
                         recorder_durations, ts_assignments,
                         video_diagnostics=None):
-        """Build a sorted timeline from matching results.
-
-        Synced items are placed in video order. Orphan recorder groups
-        (those not matched to any video) are inserted chronologically
-        relative to the matched items.
-
-        Args:
-            videos: List of video dicts with 'path' and 'card' keys.
-            audio_groups: List of audio group dicts with 'zoom_dir', 'card'.
-            video_infos: List of media info dicts per video.
-            audio_wav_by_type: List of wav_by_type dicts per audio group.
-            matched_pairs: Dict vi -> (ri, sync_data_dict).
-            matched_recorders: Set of matched recorder indices.
-            recorder_durations: List of durations per recorder group.
-            ts_assignments: Dict vi -> (ri, predicted_offset).
-            video_diagnostics: Optional dict vi -> diagnostic record (v1.1).
-
-        Returns:
-            List of timeline item dicts.
-        """
-        if video_diagnostics is None:
-            video_diagnostics = {}
-
-        items = []
-        orphan_recorders = sorted(
-            ri for ri in range(len(audio_groups))
-            if ri not in matched_recorders
+        """Build a sorted timeline from matching results."""
+        return build_timeline(
+            videos, audio_groups, video_infos, audio_wav_by_type,
+            matched_pairs, matched_recorders, recorder_durations,
+            ts_assignments, video_diagnostics,
         )
-        orphan_ptr = 0
-
-        for vi in range(len(videos)):
-            if vi in matched_pairs:
-                ri, sync_data = matched_pairs[vi]
-                # Insert orphan recorders that come before this recorder
-                while (
-                    orphan_ptr < len(orphan_recorders)
-                    and orphan_recorders[orphan_ptr] < ri
-                ):
-                    oi = orphan_recorders[orphan_ptr]
-                    items.append(self._audio_only_item(
-                        audio_wav_by_type[oi],
-                        audio_groups[oi]["zoom_dir"].name,
-                        audio_groups[oi].get("card", ""),
-                    ))
-                    orphan_ptr += 1
-
-                item = {
-                    "type": "synced",
-                    "video_info": video_infos[vi],
-                    "wav_by_type": audio_wav_by_type[ri],
-                    "offset": sync_data.get("offset", 0.0),
-                    "confidence": sync_data.get("confidence", 0.0),
-                    "peak_ratio": sync_data.get("peak_ratio"),
-                    "method": sync_data.get("method", "?"),
-                    "level": sync_data.get("level", 0),
-                    "video_name": videos[vi]["path"].name,
-                    "audio_name": audio_groups[ri]["zoom_dir"].name,
-                    "card": videos[vi].get("card", ""),
-                    "source_folder": videos[vi].get("source_folder", ""),
-                }
-                if vi in video_diagnostics:
-                    item["diagnostics"] = video_diagnostics[vi]
-                items.append(item)
-            else:
-                # Insert orphan recorders before this unmatched video
-                while (
-                    orphan_ptr < len(orphan_recorders)
-                    and orphan_recorders[orphan_ptr] <= vi
-                ):
-                    oi = orphan_recorders[orphan_ptr]
-                    items.append(self._audio_only_item(
-                        audio_wav_by_type[oi],
-                        audio_groups[oi]["zoom_dir"].name,
-                        audio_groups[oi].get("card", ""),
-                    ))
-                    orphan_ptr += 1
-
-                item = self._video_only_item(
-                    video_infos[vi],
-                    videos[vi]["path"].name,
-                    videos[vi].get("card", ""),
-                )
-                if vi in video_diagnostics:
-                    item["diagnostics"] = video_diagnostics[vi]
-                items.append(item)
-
-        # Append remaining orphan recorders
-        while orphan_ptr < len(orphan_recorders):
-            oi = orphan_recorders[orphan_ptr]
-            items.append(self._audio_only_item(
-                audio_wav_by_type[oi],
-                audio_groups[oi]["zoom_dir"].name,
-                audio_groups[oi].get("card", ""),
-            ))
-            orphan_ptr += 1
-
-        return items
 
     # ------------------------------------------------------------------
     # Main matching entry point
