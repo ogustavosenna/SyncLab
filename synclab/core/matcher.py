@@ -21,9 +21,14 @@ v1.3.0 refactoring:
     for backward compatibility.
 """
 
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from synclab.core.audio import format_duration, safe_remove
+
+logger = logging.getLogger(__name__)
 from synclab.core.media import get_media_info
 from synclab.core.metadata import (
     get_video_creation_time,
@@ -42,6 +47,146 @@ from synclab.core.timeline import (
     video_only_item,
     build_timeline,
 )
+
+
+def _brute_force_one_video(
+    engine, vi, video, video_info, audio_groups,
+    recorder_durations, temp_dir, config, multi_source,
+):
+    """Process one unmatched video against all audio groups.
+
+    Designed to run in a ThreadPoolExecutor.  Thread-safe because:
+    - engine._zoom_cache is protected by _zoom_lock
+    - Each video gets its own cam_wav temp file (unique per video path)
+    - All other inputs are read-only
+
+    Returns a dict with match results, or a no-match diagnostic dict.
+    """
+    vdur = video_info.get("duration", 0.0)
+    nr = len(audio_groups)
+    threshold = config.get("threshold", 0.05)
+    min_pr = config.get("min_peak_ratio", 2.0)
+    v_src = video.get("source_folder", "")
+
+    cam_wav = engine.prepare_camera_audio(
+        video["path"], temp_dir, vdur,
+    )
+    if cam_wav is None:
+        return {
+            "vi": vi, "matched": False,
+            "diagnostics": {
+                "video_name": video["path"].name,
+                "method_used": "no_camera_audio",
+            },
+        }
+
+    try:
+        best_ri = -1
+        best_result = {
+            "offset": 0.0, "confidence": 0.0,
+            "method": "none", "level": 0,
+        }
+        best_same_ri = -1
+        best_same_result = dict(best_result)
+        bf_stage_records = []
+
+        for ri in range(nr):
+            rdur = recorder_durations[ri]
+            if vdur > 10 and rdur < vdur * 0.5:
+                continue
+
+            ag = audio_groups[ri]
+
+            result = engine.sync_with_zoom(
+                cam_wav, ag["wav_files"], temp_dir,
+                suffix=f"r{ri}_bf{vi}",
+            )
+
+            bf_diag = result.pop("diagnostics", {})
+            bf_stage_records.append({
+                "audio_group": ag["zoom_dir"].name,
+                "ri": ri,
+                "offset": result.get("offset", 0.0),
+                "confidence": result.get("confidence", 0.0),
+                "peak_ratio": result.get("peak_ratio"),
+                "method": result.get("method", "?"),
+                "stages": bf_diag.get("stages", []),
+                "speech_ratio": bf_diag.get("speech_ratio"),
+            })
+
+            conf = result.get("confidence", 0.0)
+            off = result.get("offset", 0.0)
+
+            max_cam = config.get("max_camera_sec", 60)
+            if conf > 0 and not valid_offset(off, vdur, rdur, max_cam):
+                continue
+
+            if conf > best_result.get("confidence", 0.0):
+                best_ri = ri
+                best_result = result
+
+            a_src = ag.get("source_folder", "")
+            if a_src == v_src and conf > best_same_result.get("confidence", 0.0):
+                best_same_ri = ri
+                best_same_result = result
+
+        # Source-folder preference
+        chosen_ri = best_ri
+        chosen_result = best_result
+        if (
+            multi_source
+            and best_same_ri >= 0
+            and best_same_result.get("confidence", 0.0) >= threshold
+        ):
+            chosen_ri = best_same_ri
+            chosen_result = best_same_result
+
+        bf_pr = chosen_result.get("peak_ratio") or 0.0
+        bf_conf = chosen_result.get("confidence", 0.0)
+
+        if (
+            chosen_ri >= 0
+            and bf_conf >= threshold
+            and (bf_pr <= 0 or bf_pr >= min_pr)
+        ):
+            ag = audio_groups[chosen_ri]
+            return {
+                "vi": vi,
+                "matched": True,
+                "ri": chosen_ri,
+                "result": chosen_result,
+                "diagnostics": {
+                    "video_name": video["path"].name,
+                    "audio_group": ag["zoom_dir"].name,
+                    "video_duration": vdur,
+                    "recorder_duration": recorder_durations[chosen_ri],
+                    "method_used": f"brute_force:{chosen_result.get('method', '?')}",
+                    "confidence": bf_conf,
+                    "peak_ratio": bf_pr,
+                    "predicted_offset": None,
+                    "brute_force_candidates": bf_stage_records,
+                },
+            }
+        else:
+            why = "brute_force_no_match"
+            if chosen_ri >= 0 and bf_conf >= threshold and bf_pr > 0 and bf_pr < min_pr:
+                why = f"brute_force_weak_peak ({bf_pr:.2f} < {min_pr})"
+            return {
+                "vi": vi,
+                "matched": False,
+                "diagnostics": {
+                    "video_name": video["path"].name,
+                    "audio_group": None,
+                    "video_duration": vdur,
+                    "method_used": "no_match",
+                    "confidence": bf_conf,
+                    "peak_ratio": bf_pr,
+                    "why_fallback": why,
+                    "brute_force_candidates": bf_stage_records,
+                },
+            }
+    finally:
+        safe_remove(cam_wav)
 
 
 class SmartMatcher:
@@ -672,162 +817,75 @@ class SmartMatcher:
 
         if unmatched_vis:
             n_bf = len(unmatched_vis)
+
+            # Pre-warm zoom cache to avoid lock contention during
+            # parallel execution (all ffmpeg extractions happen here,
+            # once, sequentially).
+            self.engine.warm_zoom_cache(audio_groups, temp_dir)
+
+            max_workers = min(n_bf, max(1, (os.cpu_count() or 4) - 2))
             notify("phase", {
                 "name": "brute_force",
                 "description": (
                     f"Audio brute-force for {n_bf} "
-                    f"unmatched videos"
+                    f"unmatched videos ({max_workers} threads)"
                 ),
                 "bf_total": n_bf,
             })
 
-            for bf_idx, vi in enumerate(unmatched_vis):
-                v = videos[vi]
-                v_info = video_infos[vi]
-                vdur = v_info.get("duration", 0.0)
-
-                notify("info", {
-                    "message": (
-                        f"{v['path'].name} ({format_duration(vdur)}) "
-                        f"-> trying all audio groups..."
-                    ),
-                })
-
-                cam_wav = self.engine.prepare_camera_audio(
-                    v["path"], temp_dir, vdur,
-                )
-                if cam_wav is None:
+            # Dispatch parallel workers
+            futures = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for bf_idx, vi in enumerate(unmatched_vis):
+                    v = videos[vi]
                     notify("info", {
-                        "message": f"No camera audio for {v['path'].name}",
+                        "message": (
+                            f"{v['path'].name} "
+                            f"({format_duration(video_infos[vi].get('duration', 0))}) "
+                            f"-> queued for brute-force"
+                        ),
                     })
-                    continue
+                    future = pool.submit(
+                        _brute_force_one_video,
+                        engine=self.engine,
+                        vi=vi,
+                        video=v,
+                        video_info=video_infos[vi],
+                        audio_groups=audio_groups,
+                        recorder_durations=recorder_durations,
+                        temp_dir=temp_dir,
+                        config=self.config,
+                        multi_source=multi_source,
+                    )
+                    futures[future] = (bf_idx, vi)
 
-                try:
-                    best_ri = -1
-                    best_result = {
-                        "offset": 0.0,
-                        "confidence": 0.0,
-                        "method": "none",
-                        "level": 0,
-                    }
-                    # Track best same-source match separately for preference
-                    best_same_ri = -1
-                    best_same_result = dict(best_result)
-                    v_src = v.get("source_folder", "")
-                    bf_stage_records = []  # collect per-group diagnostics
-
-                    for ri in range(nr):
-                        rdur = recorder_durations[ri]
-                        # Recorder must be at least 50% of video duration
-                        if vdur > 10 and rdur < vdur * 0.5:
-                            continue
-
-                        ag = audio_groups[ri]
-                        desc = (
-                            f"[{bf_idx+1}/{n_bf}] {v['path'].stem[:12]} "
-                            f"x {ag['zoom_dir'].name} (brute-force)"
+                # Collect results as they complete
+                for done_count, future in enumerate(as_completed(futures)):
+                    bf_idx, vi = futures[future]
+                    try:
+                        bf_result = future.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "Brute-force worker failed for video %d: %s",
+                            vi, exc,
                         )
-                        notify("progress", {
-                            "phase": "brute_force",
-                            "video_index": vi,
-                            "bf_index": bf_idx,
-                            "bf_total": n_bf,
-                            "detail": desc,
-                        })
+                        continue
 
-                        result = self.engine.sync_with_zoom(
-                            cam_wav, ag["wav_files"], temp_dir,
-                            suffix=f"r{ri}_bf",
-                        )
+                    # Update shared state (main thread only — safe)
+                    video_diagnostics[vi] = bf_result.get("diagnostics", {})
 
-                        # -- Collect per-group diagnostics (v1.1) --
-                        bf_diag = result.pop("diagnostics", {})
-                        bf_stage_records.append({
-                            "audio_group": ag["zoom_dir"].name,
-                            "ri": ri,
-                            "offset": result.get("offset", 0.0),
-                            "confidence": result.get("confidence", 0.0),
-                            "peak_ratio": result.get("peak_ratio"),
-                            "method": result.get("method", "?"),
-                            "stages": bf_diag.get("stages", []),
-                            "speech_ratio": bf_diag.get("speech_ratio"),
-                        })
-
-                        conf = result.get("confidence", 0.0)
-                        off = result.get("offset", 0.0)
-
-                        if conf > 0 and not self._valid_offset(
-                            off, vdur, rdur,
-                        ):
-                            continue
-
-                        # Track global best
-                        if conf > best_result.get("confidence", 0.0):
-                            best_ri = ri
-                            best_result = result
-
-                        # Track best same-source match (for multi-source preference)
-                        a_src = ag.get("source_folder", "")
-                        if a_src == v_src and conf > best_same_result.get("confidence", 0.0):
-                            best_same_ri = ri
-                            best_same_result = result
-
-                    # -- Source-folder preference logic (v1.2.1) --
-                    # When in multi-source mode, prefer same-source matches
-                    # to avoid cross-day false positives. Only use cross-source
-                    # if no same-source match exceeds threshold.
-                    chosen_ri = best_ri
-                    chosen_result = best_result
-                    if (
-                        multi_source
-                        and best_same_ri >= 0
-                        and best_same_result.get("confidence", 0.0) >= threshold
-                    ):
-                        chosen_ri = best_same_ri
-                        chosen_result = best_same_result
-                        if best_same_ri != best_ri:
-                            notify("info", {
-                                "message": (
-                                    f"  Source preference: {v['path'].name} "
-                                    f"[{v_src}] → same-source "
-                                    f"{audio_groups[best_same_ri]['zoom_dir'].name} "
-                                    f"(conf={best_same_result.get('confidence', 0):.3f}) "
-                                    f"over cross-source "
-                                    f"{audio_groups[best_ri]['zoom_dir'].name} "
-                                    f"(conf={best_result.get('confidence', 0):.3f})"
-                                ),
-                            })
-
-                    # Check peak_ratio quality for brute-force
-                    bf_pr = chosen_result.get("peak_ratio") or 0.0
-                    min_pr = self.config.get("min_peak_ratio", 2.0)
-                    bf_conf = chosen_result.get("confidence", 0.0)
-
-                    if (
-                        chosen_ri >= 0
-                        and bf_conf >= threshold
-                        and (bf_pr <= 0 or bf_pr >= min_pr)
-                    ):
-                        matched_pairs[vi] = (chosen_ri, chosen_result)
-                        matched_recorders.add(chosen_ri)
+                    if bf_result.get("matched"):
+                        ri = bf_result["ri"]
+                        matched_pairs[vi] = (ri, bf_result["result"])
+                        matched_recorders.add(ri)
                         total_synced_audio += 1
-                        ag = audio_groups[chosen_ri]
-                        conf = bf_conf
-                        off = chosen_result.get("offset", 0.0)
-                        method = chosen_result.get("method", "?")
-                        video_diagnostics[vi] = {
-                            "video_name": v["path"].name,
-                            "audio_group": ag["zoom_dir"].name,
-                            "video_duration": vdur,
-                            "recorder_duration": recorder_durations[chosen_ri],
-                            "method_used": f"brute_force:{method}",
-                            "confidence": conf,
-                            "peak_ratio": bf_pr,
-                            "predicted_offset": None,
-                            "brute_force_candidates": bf_stage_records,
-                        }
+                        ag = audio_groups[ri]
+                        conf = bf_result["result"].get("confidence", 0.0)
+                        off = bf_result["result"].get("offset", 0.0)
+                        method = bf_result["result"].get("method", "?")
+                        bf_pr = bf_result["result"].get("peak_ratio") or 0.0
                         notify("match", {
-                            "video": v["path"].name,
+                            "video": videos[vi]["path"].name,
                             "audio": ag["zoom_dir"].name,
                             "method": f"brute_force:{method}",
                             "offset": off,
@@ -835,30 +893,20 @@ class SmartMatcher:
                             "peak_ratio": bf_pr,
                         })
                     else:
-                        why = "brute_force_no_match"
-                        if chosen_ri >= 0 and bf_conf >= threshold and bf_pr > 0 and bf_pr < min_pr:
-                            why = f"brute_force_weak_peak ({bf_pr:.2f} < {min_pr})"
-                        video_diagnostics[vi] = {
-                            "video_name": v["path"].name,
-                            "audio_group": None,
-                            "video_duration": vdur,
-                            "method_used": "no_match",
-                            "confidence": bf_conf,
-                            "peak_ratio": bf_pr,
-                            "why_fallback": why,
-                            "brute_force_candidates": bf_stage_records,
-                        }
+                        diag = bf_result.get("diagnostics", {})
                         notify("info", {
                             "message": (
-                                f"No match for {v['path'].name} "
-                                f"(best: conf={bf_conf:.3f}, "
-                                f"peak_ratio={bf_pr:.2f}, "
-                                f"min_peak_ratio={min_pr})"
+                                f"No match for {videos[vi]['path'].name} "
+                                f"(best: conf={diag.get('confidence', 0):.3f}, "
+                                f"peak_ratio={diag.get('peak_ratio', 0):.2f})"
                             ),
                         })
 
-                finally:
-                    safe_remove(cam_wav)
+                    notify("progress", {
+                        "phase": "brute_force",
+                        "bf_index": done_count,
+                        "bf_total": n_bf,
+                    })
 
         # ==============================================================
         # Cleanup and build timeline

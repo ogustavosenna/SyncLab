@@ -32,6 +32,7 @@ Dependencies: numpy, scipy (only).
 from __future__ import annotations
 
 import gc
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -115,6 +116,7 @@ class SyncEngine:
 
         # Cache: key = str(wav_path) -> value = Path to temp file
         self._zoom_cache: Dict[str, Path] = {}
+        self._zoom_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Progress helper
@@ -201,30 +203,66 @@ class SyncEngine:
             Path to the cached/extracted WAV, or ``None`` on failure.
         """
         key = str(wav_path)
-        if key in self._zoom_cache:
-            cached = self._zoom_cache[key]
-            if cached.exists() and cached.stat().st_size > 1000:
-                return cached
+
+        # Fast path: check cache under lock
+        with self._zoom_lock:
+            if key in self._zoom_cache:
+                cached = self._zoom_cache[key]
+                if cached.exists() and cached.stat().st_size > 1000:
+                    return cached
 
         uid = f"{Path(wav_path).stem[:30]}_{suffix}"
         ea_temp = temp_dir / f"_ea_{uid}.wav"
 
         if ea_temp.exists() and ea_temp.stat().st_size > 1000:
-            self._zoom_cache[key] = ea_temp
+            with self._zoom_lock:
+                self._zoom_cache[key] = ea_temp
             return ea_temp
 
         ok = extract_wav(wav_path, ea_temp, self.sr, self.max_sec_zoom)
         if ok:
-            self._zoom_cache[key] = ea_temp
+            with self._zoom_lock:
+                self._zoom_cache[key] = ea_temp
             return ea_temp
 
         return None
 
+    def warm_zoom_cache(
+        self,
+        audio_groups: List[dict],
+        temp_dir: Path,
+    ) -> int:
+        """Pre-extract all Zoom audio files into the cache.
+
+        Call this before parallel brute-force to eliminate lock
+        contention during multi-threaded sync_with_zoom calls.
+
+        Parameters
+        ----------
+        audio_groups : list of dict
+            Audio groups, each with a ``wav_files`` key.
+        temp_dir : Path
+            Temporary directory for extracted files.
+
+        Returns
+        -------
+        int
+            Number of files successfully cached.
+        """
+        cached = 0
+        for ag in audio_groups:
+            for wav in ag.get("wav_files", []):
+                result = self._get_zoom_audio(wav, temp_dir)
+                if result is not None:
+                    cached += 1
+        return cached
+
     def clear_zoom_cache(self) -> None:
         """Delete all cached Zoom temp files and reset the cache."""
-        for _key, path in self._zoom_cache.items():
-            safe_remove(path)
-        self._zoom_cache.clear()
+        with self._zoom_lock:
+            for _key, path in self._zoom_cache.items():
+                safe_remove(path)
+            self._zoom_cache.clear()
 
     # ------------------------------------------------------------------
     # Wrappers — delegate to module-level functions in dsp.py / xcorr.py
