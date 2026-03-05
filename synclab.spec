@@ -15,6 +15,8 @@ a = Analysis(
     binaries=[],
     datas=[
         ('synclab/app/static', 'synclab/app/static'),
+        ('C:/ffmpeg/bin/ffmpeg.exe', 'ffmpeg'),
+        ('C:/ffmpeg/bin/ffprobe.exe', 'ffmpeg'),
     ],
     hiddenimports=[
         # scipy submodules (used in core/audio.py and core/engine.py)

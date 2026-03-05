@@ -7,7 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from synclab.subprocess_utils import subprocess_hide_window
+from synclab.subprocess_utils import subprocess_hide_window, get_ffmpeg
 
 import numpy as np
 from scipy import signal
@@ -28,7 +28,7 @@ def extract_wav(input_path, output_path, sample_rate=8000, max_sec=0):
     """
     try:
         cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
+            get_ffmpeg(), "-y", "-v", "quiet",
             "-i", str(input_path),
             "-vn", "-ac", "1", "-ar", str(sample_rate),
         ]

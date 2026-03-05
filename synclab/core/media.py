@@ -7,7 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from synclab.subprocess_utils import subprocess_hide_window
+from synclab.subprocess_utils import subprocess_hide_window, get_ffprobe
 
 
 def get_media_info(file_path):
@@ -39,7 +39,7 @@ def get_media_info(file_path):
 
     try:
         cmd = [
-            "ffprobe", "-v", "quiet",
+            get_ffprobe(), "-v", "quiet",
             "-print_format", "json",
             "-show_format", "-show_streams",
             str(fp),

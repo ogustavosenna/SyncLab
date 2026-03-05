@@ -45,10 +45,10 @@ def get_video_creation_time(video_path: Path) -> Optional[datetime.datetime]:
     """
     # Priority 1: ffprobe creation_time tag
     try:
-        from synclab.subprocess_utils import subprocess_hide_window
+        from synclab.subprocess_utils import subprocess_hide_window, get_ffprobe
         r = subprocess.run(
             [
-                "ffprobe", "-v", "quiet",
+                get_ffprobe(), "-v", "quiet",
                 "-print_format", "json",
                 "-show_format", str(video_path),
             ],
