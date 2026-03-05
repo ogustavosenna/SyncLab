@@ -26,8 +26,17 @@ NUL
 *.tmp
 *.wav
 
-# Reports (keep in repo but ignore old ones)
-# REPORT_v*.md is tracked
+# Internal reports (AI reviewer reports, not for public)
+REPORT_*.md
+RELATORIO_*.md
+TECHNICAL_REPORT_*.md
+GEMINI_REPORT_*.md
+
+# Claude Code
+.claude/
+
+# Inno Setup temp installer
+installer/innosetup_installer.exe
 
 # Assets (reference images)
 _ref_icons/
