@@ -30,7 +30,7 @@ python -m PyInstaller synclab.spec
 
 ## License
 
-[MIT](LICENSE) — Copyright 2026 Gustavo Soares
+[MIT](LICENSE) — Copyright 2026 Gustavo Senna
 
 ## Code Signing Policy
 
